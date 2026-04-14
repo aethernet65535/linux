@@ -335,13 +335,16 @@ MODULE_PARM_DESC(addr_unit,
 static int damon_reclaim_enabled_store(const char *val,
 		const struct kernel_param *kp)
 {
-	bool is_enabled = enabled;
+	bool is_enabled = false;
 	bool enable;
 	int err;
 
 	err = kstrtobool(val, &enable);
 	if (err)
 		return err;
+
+	if (ctx)
+		is_enabled = damon_is_running(ctx);
 
 	if (is_enabled == enable)
 		return 0;
