@@ -50,6 +50,7 @@ int damon_perf_probe_setup(struct damon_ctx *ctx,
 			   struct damon_perf_probe_event *event);
 void damon_perf_probe_teardown(struct damon_ctx *ctx,
 			       struct damon_perf_probe_event *event);
+unsigned long damon_get_perf_seen(void);
 
 #endif /* CONFIG_DAMON_PERF_SOURCE */
 #endif /* _DAMON_PERF_SOURCE_H */

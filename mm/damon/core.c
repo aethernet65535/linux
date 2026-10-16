@@ -4927,6 +4927,8 @@ static void kdamond_check_reported_accesses(struct damon_ctx *ctx)
 	if (damon_drains_ring_perf(ctx))
 		__kdamond_drain_ring(ctx, tbl, ctx->perf_rings,
 				&ctx->perf_pending);
+
+	trace_damon_perf_source_stats(damon_get_perf_seen());
 }
 
 /*

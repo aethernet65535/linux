@@ -199,6 +199,23 @@ TRACE_EVENT(damon_aggregated,
 			__entry->nr_accesses, __entry->age)
 );
 
+TRACE_EVENT(damon_perf_source_stats,
+
+	TP_PROTO(unsigned long seen),
+
+	TP_ARGS(seen),
+
+	TP_STRUCT__entry(
+		__field(unsigned long, seen)
+	),
+
+	TP_fast_assign(
+		__entry->seen = seen;
+	),
+
+	TP_printk("seen=%lu", __entry->seen)
+)
+
 #endif /* _TRACE_DAMON_H */
 
 /* This part must be outside protection */

@@ -27,6 +27,8 @@ struct damon_perf_probe_state {
 	struct perf_event *single_event;
 };
 
+static DEFINE_PER_CPU(unsigned long, damon_perf_seen);
+
 static void damon_perf_overflow(struct perf_event *perf_event,
 				struct perf_sample_data *data,
 				struct pt_regs *regs)
@@ -39,6 +41,8 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 		.size = PAGE_SIZE,
 		.cpu = smp_processor_id(),
 	};
+
+	this_cpu_inc(damon_perf_seen);
 
 	/*
 	 * Teardown NULLs event->ctx (with a release barrier) before releasing
@@ -82,6 +86,16 @@ static void damon_perf_overflow(struct perf_event *perf_event,
 	/* global id: the drain compares it with the target task's tgid */
 	report.tgid = task_tgid_nr(current);
 	damon_report_access(&report);
+}
+
+unsigned long damon_get_perf_seen(void)
+{
+	unsigned long sum = 0;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		sum += per_cpu(damon_perf_seen, cpu);
+	return sum;
 }
 
 static enum cpuhp_state damon_perf_cpuhp_state;
