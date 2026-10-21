@@ -1531,8 +1531,8 @@ static int perf_ibs_handle_irq(struct perf_ibs *perf_ibs, struct pt_regs *iregs)
 	struct pt_regs regs;
 	struct perf_ibs_data ibs_data;
 	int offset, size, check_rip, offset_max, throttle = 0;
-	unsigned int msr;
-	u64 *buf, *config, period, new_config = 0;
+	unsigned int msr, loops = 0;
+	u64 *buf, *config, period, new_config = 0, opctl;
 	int br_target_idx = -1;
 
 	if (!test_bit(IBS_STARTED, pcpu->state)) {
@@ -1554,6 +1554,16 @@ fail:
 
 	hwc = &event->hw;
 	msr = hwc->config_base;
+
+again:
+	/*
+	 * A second latched sample may be processed in this same NMI
+	 * (see the recheck after re-arming); reset per-pass state.
+	 */
+	throttle = 0;
+	br_target_idx = -1;
+	new_config = 0;
+
 	buf = ibs_data.regs;
 	rdmsrq(msr, *buf);
 	if (!(*buf++ & perf_ibs->valid_mask))
@@ -1702,6 +1712,26 @@ out:
 		new_config |= period >> 4;
 
 		perf_ibs_enable_event(perf_ibs, hwc, new_config);
+
+		/*
+		 * The counter may complete again while NMIs are still
+		 * blocked -- between the re-arm above and IRET -- and
+		 * such an overflow would set VAL and assert an NMI edge
+		 * that can never be delivered: the edge is consumed
+		 * while this NMI is in service, latching the counter
+		 * with nothing left to clear it. Catch it here, while
+		 * the sample can still be processed.
+		 *
+		 * One extra pass is plenty: re-arming to the next
+		 * overflow takes a full counter period, much longer
+		 * than this loop costs. The bound is only a safety
+		 * valve against a pathological instant re-latch.
+		 */
+		if (++loops < 4) {
+			rdmsrq(msr, opctl);
+			if (opctl & perf_ibs->valid_mask)
+				goto again;
+		}
 	}
 
 	perf_event_update_userpage(event);
