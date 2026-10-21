@@ -26,6 +26,7 @@ static u32 ibs_caps;
 
 #include <linux/kprobes.h>
 #include <linux/hardirq.h>
+#include <linux/hrtimer.h>
 
 #include <asm/nmi.h>
 #include <asm/amd/ibs.h>
@@ -86,6 +87,10 @@ enum ibs_states {
 struct cpu_perf_ibs {
 	struct perf_event	*event;
 	unsigned long		state[BITS_TO_LONGS(IBS_MAX_STATES)];
+	struct perf_ibs		*ibs;
+	struct hrtimer		rescue_timer;
+	bool			val_seen;
+	u64			rescued;
 };
 
 struct perf_ibs {
@@ -546,6 +551,85 @@ static inline void perf_ibs_disable_event(struct perf_ibs *perf_ibs,
 	wrmsrq(hwc->config_base, config);
 }
 
+#define IBS_RESCUE_INTERVAL_MS		1000
+#define IBS_RECONFIRM_INTERVAL_MS	10
+
+/*
+ * IBS raises its overflow interrupt as an edge-triggered NMI. If the
+ * edge is lost -- NMIs are blocked at the moment the counter latches,
+ * e.g. by SMM -- the hardware stays latched forever: IBSOPCTL.VAL is
+ * set, the counter is halted, and the only code path that clears VAL
+ * is the IBS NMI handler itself. One lost edge would otherwise
+ * silence sampling on this CPU permanently.
+ *
+ * AMD documents this failure class in the Family 19h revision guides
+ * and suggests the mitigation: periodic interrupts from another
+ * source, so the IBS handler can detect the latched sample. Patrol
+ * IBSOPCTL from a per-CPU timer instead, which bounds recovery by
+ * the timer interval regardless of CPU load, idle state or NMI
+ * watchdog configuration.
+ *
+ * A healthy latch lives for microseconds (sample + NMI), so a single
+ * sighting is only recorded and re-confirmed after a short delay;
+ * this keeps the rescue from racing a live NMI into a spurious
+ * unhandled NMI. On confirmation clear VAL, preserving the programmed
+ * counter configuration, and let the hardware run again.
+ */
+static enum hrtimer_restart perf_ibs_rescue_fn(struct hrtimer *timer)
+{
+	struct cpu_perf_ibs *pcpu = container_of(timer, struct cpu_perf_ibs,
+						 rescue_timer);
+	const struct perf_ibs *perf_ibs = pcpu->ibs;
+	struct hw_perf_event *hwc;
+	u64 opctl;
+
+	if (!test_bit(IBS_STARTED, pcpu->state))
+		return HRTIMER_NORESTART;
+
+	if (WARN_ON_ONCE(!pcpu->event))
+		return HRTIMER_NORESTART;
+
+	hwc = &pcpu->event->hw;
+	rdmsrq(hwc->config_base, opctl);
+
+	if (!(opctl & perf_ibs->valid_mask)) {
+		pcpu->val_seen = false;
+		goto patrol;
+	}
+
+	if (!pcpu->val_seen) {
+		pcpu->val_seen = true;
+		hrtimer_forward_now(timer,
+				    ms_to_ktime(IBS_RECONFIRM_INTERVAL_MS));
+		return HRTIMER_RESTART;
+	}
+
+	pcpu->rescued++;
+	pr_warn_ratelimited("perf/amd/ibs: lost NMI on CPU%u; re-armed %llu\n",
+			    raw_smp_processor_id(), pcpu->rescued);
+
+	/*
+	 * Re-read so a racing NMI's re-arm is not blindly undone, then
+	 * clear VAL only: MaxCnt, Enable and reserved bits must survive
+	 * as they would after the handler's own re-arm. On IBS_CAPS_DIS
+	 * hardware mirror the handler's disable/re-enable dance around
+	 * the write, since a bare CTL write may not restart the
+	 * counter there.
+	 */
+	if (ibs_caps & IBS_CAPS_DIS)
+		wrmsrq(hwc->extra_reg.reg, perf_ibs->disable_mask);
+	rdmsrq(hwc->config_base, opctl);
+	if (opctl & perf_ibs->valid_mask)
+		wrmsrq(hwc->config_base, opctl & ~perf_ibs->valid_mask);
+	if (hwc->extra_reg.reg)
+		wrmsrq(hwc->extra_reg.reg, hwc->extra_reg.config);
+	pcpu->val_seen = false;
+
+patrol:
+	hrtimer_forward_now(timer, ms_to_ktime(IBS_RESCUE_INTERVAL_MS));
+	return HRTIMER_RESTART;
+}
+
 /*
  * We cannot restore the ibs pmu state, so we always needs to update
  * the event while stopping it and then reset the state when starting
@@ -591,6 +675,27 @@ static void perf_ibs_start(struct perf_event *event, int flags)
 	clear_bit(IBS_STOPPING, pcpu->state);
 	perf_ibs_enable_event(perf_ibs, hwc, config);
 
+	/*
+	 * Set up the rescue timer on the CPU that owns it: hrtimer
+	 * setup must run on this CPU to bind the timer to this CPU's
+	 * hrtimer base, and the per-CPU data does not exist yet when
+	 * the cpuhp callback first runs at boot.
+	 */
+	if (!pcpu->rescue_timer.function) {
+		pcpu->ibs = perf_ibs;
+		hrtimer_setup(&pcpu->rescue_timer, perf_ibs_rescue_fn,
+			      CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_HARD);
+	}
+
+	/*
+	 * Patrol IBSOPCTL for a latched sample whose NMI never
+	 * arrived; perf_ibs_stop() cancels the timer again.
+	 */
+	pcpu->val_seen = false;
+	hrtimer_start(&pcpu->rescue_timer,
+		      ms_to_ktime(IBS_RESCUE_INTERVAL_MS),
+		      HRTIMER_MODE_REL_PINNED_HARD);
+
 	perf_event_update_userpage(event);
 }
 
@@ -604,6 +709,19 @@ static void perf_ibs_stop(struct perf_event *event, int flags)
 
 	if (test_and_set_bit(IBS_STOPPING, pcpu->state))
 		return;
+
+	/*
+	 * Stop the rescue timer; being pinned to this CPU it cannot
+	 * be running concurrently here. Skip the cancel when called
+	 * from the IBS NMI handler itself (the throttle and event
+	 * limit paths reach pmu::stop from NMI context): taking the
+	 * hrtimer base lock in NMI could deadlock against a same-CPU
+	 * lock holder, and the callback self-disarms on its next
+	 * fire, after IBS_STARTED is cleared below. A timer that was
+	 * never set up does not need cancelling either.
+	 */
+	if (!in_nmi() && pcpu->rescue_timer.function)
+		hrtimer_cancel(&pcpu->rescue_timer);
 
 	stopping = test_bit(IBS_STARTED, pcpu->state);
 
@@ -1973,7 +2091,27 @@ static inline void perf_ibs_pm_init(void) { }
 
 static int x86_pmu_amd_ibs_dying_cpu(unsigned int cpu)
 {
+	struct cpu_perf_ibs *pcpu;
+
 	clear_APIC_ibs();
+
+	/*
+	 * Rescue timers are cancelled from perf_ibs_stop() when the
+	 * events are taken down; cancel again here for safety on the
+	 * CPU hotplug path.
+	 */
+	if (perf_ibs_op.pcpu) {
+		pcpu = this_cpu_ptr(perf_ibs_op.pcpu);
+		if (pcpu->rescue_timer.function)
+			hrtimer_cancel(&pcpu->rescue_timer);
+	}
+
+	if (perf_ibs_fetch.pcpu) {
+		pcpu = this_cpu_ptr(perf_ibs_fetch.pcpu);
+		if (pcpu->rescue_timer.function)
+			hrtimer_cancel(&pcpu->rescue_timer);
+	}
+
 	return 0;
 }
 
