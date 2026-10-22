@@ -21421,6 +21421,7 @@ F:	arch/*/kernel/*/perf_event*.c
 F:	arch/*/kernel/perf_callchain.c
 F:	arch/*/kernel/perf_event*.c
 F:	include/linux/perf_event.h
+F:	include/trace/events/perf_ibs.h
 F:	include/uapi/linux/perf_event.h
 F:	kernel/events/*
 F:	tools/lib/perf/

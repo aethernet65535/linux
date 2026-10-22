@@ -31,6 +31,9 @@ static u32 ibs_caps;
 #include <asm/nmi.h>
 #include <asm/amd/ibs.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/perf_ibs.h>
+
 /* attr.config2 */
 #define IBS_SW_FILTER_MASK	1
 
@@ -604,10 +607,6 @@ static enum hrtimer_restart perf_ibs_rescue_fn(struct hrtimer *timer)
 		return HRTIMER_RESTART;
 	}
 
-	pcpu->rescued++;
-	pr_warn_ratelimited("perf/amd/ibs: lost NMI on CPU%u; re-armed %llu\n",
-			    raw_smp_processor_id(), pcpu->rescued);
-
 	/*
 	 * Re-read so a racing NMI's re-arm is not blindly undone, then
 	 * clear VAL only: MaxCnt, Enable and reserved bits must survive
@@ -619,8 +618,11 @@ static enum hrtimer_restart perf_ibs_rescue_fn(struct hrtimer *timer)
 	if (ibs_caps & IBS_CAPS_DIS)
 		wrmsrq(hwc->extra_reg.reg, perf_ibs->disable_mask);
 	rdmsrq(hwc->config_base, opctl);
-	if (opctl & perf_ibs->valid_mask)
+	if (opctl & perf_ibs->valid_mask) {
 		wrmsrq(hwc->config_base, opctl & ~perf_ibs->valid_mask);
+		pcpu->rescued++;
+		trace_ibs_nmi_rescue(hwc->config_base, opctl, pcpu->rescued);
+	}
 	if (hwc->extra_reg.reg)
 		wrmsrq(hwc->extra_reg.reg, hwc->extra_reg.config);
 	pcpu->val_seen = false;
